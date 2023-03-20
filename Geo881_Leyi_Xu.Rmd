@@ -1,0 +1,828 @@
+---
+title: "GEO881 Data Challenge 2"
+author: "Leyi Xu"
+date: '2022-04-02'
+output: 
+  html_document:
+    code_folding: show
+    fig_caption: yes
+    highlight: tango
+    number_sections: no
+    theme: journal
+    toc: yes
+    toc_depth: 2
+    toc_float: yes
+fig_width: 6
+---
+
+<style>
+body {text-align: justify}
+</style>
+
+# Preliminaries and read data
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+# ------------------------------------------------------------------------------
+options(scipen = 5000)
+options(digits.secs = 4)
+options(warning = FALSE)
+options(max.print=1000000) 
+
+# ------------------------------------------------------------------------------
+# packages:
+
+## Default repository
+local({r <- getOption("repos")
+       r["CRAN"] <- "http://cran.r-project.org" 
+       options(repos=r)
+})
+
+check_pkg <- function(x)
+  {
+    if (!require(x, character.only = TRUE, quietly = TRUE))
+    {
+      install.packages(x, dep = TRUE, verbose = FALSE, quiet = TRUE)
+        if(!require(x, character.only = TRUE, quietly = TRUE)) stop("Package not found")
+    }
+}
+
+check_pkg("tidyverse")
+check_pkg("tidyr")
+check_pkg("sf")
+check_pkg("ggplot2")
+check_pkg("reshape")
+check_pkg("tmap")
+check_pkg("lwgeom")
+check_pkg("caTools")
+check_pkg("cluster")
+check_pkg("MLmetrics")
+check_pkg("caret")
+check_pkg("class")
+check_pkg("rpart")
+check_pkg("neuralnet")
+check_pkg("stats")
+check_pkg("tictoc")
+check_pkg("here")
+
+
+check_pkg("factoextra")
+
+here::i_am("Geo881_Leyi_Xu.Rmd")
+
+# load features data
+features <- read.csv("dc-isc-lu-data.csv")
+```
+
+
+# 1. Explore the data
+```{r explore_data, echo = TRUE, warning= FALSE, message = FALSE}
+# explore the numerical columns
+# the summary of data is too long so I comment it
+# summary(features)
+
+# get the maximum and minimum values
+features_min_tw <- apply(features[, 4:171], 2, min)
+features_max_tw <- apply(features[, 4:171], 2, max)
+
+features_min_user <- apply(features[, 172:339], 2, min)
+features_max_user <- apply(features[, 172:339], 2, max)
+
+features_min_entropy <- apply(features[, 340:507], 2, min)
+features_max_entropy <- apply(features[, 340:507], 2, max)
+
+distribution_df <- data.frame("min"=c(min(features_min_tw), min(features_max_tw), min(features_min_user), min(features_max_user), min(features_min_entropy), min(features_max_entropy)),
+                              "max"=c(max(features_min_tw), max(features_max_tw), max(features_min_user), max(features_max_user), max(features_min_entropy), max(features_max_entropy)))
+rownames(distribution_df) <- c("features_min_tw", "features_max_tw", "features_min_user", "features_max_user", "features_min_entropy", "features_max_entropy")
+
+distribution_df
+
+
+# explore the the categorical columns
+# count the number of R and NR in the column label
+label_count <- features %>%
+  group_by(label) %>%
+  summarise(count = n())
+
+# plot the distribution of R and NR in the column label
+ggplot(data=label_count, aes(x=label, y=count)) +
+  geom_bar(stat="identity", width=0.2)+
+  geom_text(aes(label=count), vjust=-0.3, size=3.5)+
+  theme_minimal()
+
+
+```
+
+# 2. Clustering
+## 2.1. K-means
+```{r k-means, echo = TRUE, warning= FALSE, message = FALSE}
+# setting a random seed makes the results consistent
+set.seed(10)
+
+# for storing the kmeans results
+cluster_result <- list()
+ks = c(2:30)
+
+# run the kmeans clustering with different k values
+for(k in ks){
+  cluster_result[[k]] <- kmeans(features[, 4:507], k, iter.max = 200)
+}
+
+
+# apply elbow method to determine the best k value
+# extract the corresponding within ss for visualization
+k_withinss <- data.frame(k=numeric(0), withinss=numeric(0))
+for(k in ks){
+  k_withinss <- add_row(k_withinss, k = k, withinss = cluster_result[[k]]$tot.withinss)
+}
+
+# visualize the k against withinss to find the optimal k
+ggplot(data=k_withinss, aes(x=k, y=withinss, group=1)) +
+  geom_line()+
+  geom_point()
+
+
+# apply Silhouette analysis to determine the best k
+k_silhouette <- data.frame(k=numeric(0), silhouette=numeric(0))
+for(k in ks){
+  k_silhouette <- add_row(k_silhouette, k = k, silhouette = mean(silhouette(cluster_result[[k]]$cluster, dist(features[4:507]))[, 3]))
+}  
+
+# visualize the k against Silhouette to find the optimal k
+ggplot(data=k_silhouette, aes(x=k, y=silhouette, group=1)) +
+  geom_line()+
+  geom_point()
+
+```
+
+
+```{r assign_labels_kmeans, echo = TRUE, warning= FALSE, message = FALSE}
+# set k as 2
+best_k <- 2
+
+# bind the label with their corresponding cluster id
+cls_labels <- cbind(features[3], cluster_result[[best_k]]$cluster)
+
+# rename the column
+colnames(cls_labels)[2] <- 'cluster'
+
+# build a function to select sample and determine the labels
+sample_label <- function(cls_labels, p){
+  # select p% records from each cluster as samples
+  sample <- rbind(
+  sample_n(cls_labels[cls_labels$cluster==1, ], nrow(cls_labels[cls_labels$cluster==1, ])*p),
+  sample_n(cls_labels[cls_labels$cluster==2, ], nrow(cls_labels[cls_labels$cluster==2, ])*p)
+)
+  
+  # calculate the number of records of each cluster to each label
+  cls_labels_count <- sample %>% count(label, cluster) %>% spread(cluster, n, fill=0)
+  
+  return(cls_labels_count)
+}
+
+# select 35% records as samples and check their labels
+cls_labels_count <- sample_label(cls_labels, 0.35)
+cls_labels_count
+
+# assign labels
+cls_labels[cls_labels$cluster == 1, "cluster"] <- 'R'
+cls_labels[cls_labels$cluster == 2, "cluster"] <- 'NR'
+
+```
+
+```{r evaluate_performance_kmeans, echo = TRUE, warning= FALSE, message = FALSE}
+# evaluate the performance of the k-means method with the confusion matrix
+cm_kmeans <- ConfusionMatrix(cls_labels$cluster, cls_labels$label)
+cm_kmeans
+
+# define a function to evaluate the model performance in individual label
+micro_matrix <- function(cm){
+  n = sum(cm) # number of instances
+  nc = nrow(cm) # number of classes
+  diag = diag(cm) # number of correctly classified instances per class 
+  rowsums = apply(cm, 1, sum) # number of instances per class
+  colsums = apply(cm, 2, sum) # number of predictions per class
+   
+  precision = diag / colsums 
+  recall = diag / rowsums 
+  f1 = 2 * precision * recall / (precision + recall)  
+  
+  return(data.frame(precision, recall, f1))
+}
+
+# define a function to evaluate the model performance
+macro_matrix <- function(y_pred, y_true){
+  Accuracy = Accuracy(y_pred, y_true)
+  F1_Score = F1_Score(y_pred, y_true)
+  Recall = Recall(y_pred, y_true)
+  Precision = Precision(y_pred, y_true)
+  
+  return(data.frame(Accuracy, F1_Score, Recall, Precision))
+}
+
+
+micro_matrix(cm_kmeans)
+
+macro_matrix(cls_labels$cluster, cls_labels$label)
+
+```
+
+
+## 2.2. Dimension reduction
+```{r dimension_reduction, echo = TRUE, warning= FALSE, message = FALSE}
+# apply pca to reduce the feature dimension
+features_pca <- prcomp(features[, 4:507], center = TRUE)
+
+# the summary is too long so I comment it, it shows that PC 31 has a over 90% Cumulative Proportion
+# summary(features_pca)
+
+cluster_result_pca <- list()
+for (k in ks) {
+  cluster_result_pca[[k]] <- kmeans(features_pca$x[, 1:31], k, iter.max = 200) # use PC 1 - PC 31
+}
+
+k_withinss_pca <- data.frame(k=numeric(0), withinss=numeric(0))
+for (k in ks) {
+  k_withinss_pca <- add_row(k_withinss_pca, k = k, withinss = cluster_result_pca[[k]]$tot.withinss)
+}
+
+ggplot(k_withinss_pca, aes(x=k, y=withinss, group=1)) + 
+  geom_line() + 
+  geom_point()
+
+# apply Silhouette analysis to determine the best k
+k_silhouette_pca <- data.frame(k=numeric(0), silhouette=numeric(0))
+for(k in ks){
+  k_silhouette_pca <- add_row(k_silhouette_pca, k = k, silhouette = mean(silhouette(cluster_result_pca[[k]]$cluster, dist(features[4:507]))[, 3]))
+}  
+
+# visualize the k against Silhouette to find the optimal k
+ggplot(data=k_silhouette_pca, aes(x=k, y=silhouette, group=1)) +
+  geom_line()+
+  geom_point()
+
+
+```
+
+```{r assign_labels_pca, echo = TRUE, warning= FALSE, message = FALSE}
+# set k as 2
+best_k_pca <- 2
+
+# bind the label with their corresponding cluster id
+cls_labels_pca <- cbind(features[3], cluster_result_pca[[best_k_pca]]$cluster)
+
+# change the column name
+colnames(cls_labels_pca)[2] <- 'cluster'
+
+# sample the dataset
+cls_labels_count_pca <- sample_label(cls_labels_pca, 0.35)
+cls_labels_count_pca
+
+# assign labels to clusters
+cls_labels_pca[cls_labels_pca$cluster == 1, "cluster"] <- 'R'
+cls_labels_pca[cls_labels_pca$cluster == 2, "cluster"] <- 'NR'
+```
+
+```{r evaluate_performance_pca, echo = TRUE, warning= FALSE, message = FALSE}
+cm_kmeans_pca <- ConfusionMatrix(cls_labels_pca$cluster, cls_labels_pca$label)
+cm_kmeans_pca
+
+micro_matrix(cm_kmeans_pca)
+macro_matrix(cls_labels_pca$cluster, cls_labels_pca$label)
+```
+
+
+## 2.3. Comparison of k-means and agglomerative hierarchical clustering
+```{r agglomerative_hierarchical_clustering, echo = TRUE, warning= FALSE, message = FALSE}
+# calculate the pairwise distance matrix of all records.
+features_dist_matrix = dist(features[, 4:507], method = 'euclidean')
+
+# Try the agnes method from the 'clsuter' library
+features_agnes1 <- agnes(features[, 4:507], method='single')
+features_agnes2 <- agnes(features[, 4:507], method='weighted')
+
+# Check the agglomerative coefficient 
+print(features_agnes1$ac)
+print(features_agnes2$ac)
+
+
+# cut the final tree to get desired number of clusters
+hcl_result1 <- cutree(features_agnes1, k = 2)
+hcl_result2 <- cutree(features_agnes2, k = 2)
+
+cls_labels_agnes1 <- cbind(features[3], hcl_result1)
+cls_labels_agnes2 <- cbind(features[3], hcl_result2)
+
+# change the column name
+colnames(cls_labels_agnes1)[2] <- 'cluster'
+colnames(cls_labels_agnes2)[2] <- 'cluster'
+```
+
+```{r assign_labels_hcl, echo = TRUE, warning= FALSE, message = FALSE}
+cls_labels_count_agnes1 <- sample_label(cls_labels_agnes1, 0.35)
+cls_labels_count_agnes2 <- sample_label(cls_labels_agnes2, 0.35)
+
+cls_labels_count_agnes1
+cls_labels_count_agnes2
+
+cls_labels_agnes1[cls_labels_agnes1$cluster==1, "cluster"] <- 'NR'
+cls_labels_agnes1[cls_labels_agnes1$cluster==2, "cluster"] <- 'R'
+
+cls_labels_agnes2[cls_labels_agnes2$cluster==1, "cluster"] <- 'R'
+cls_labels_agnes2[cls_labels_agnes2$cluster==2, "cluster"] <- 'NR'
+```
+
+```{r evaluate_performance_hcl, echo = TRUE, warning= FALSE, message = FALSE}
+cm_agnes1 <- ConfusionMatrix(cls_labels_agnes1$cluster, cls_labels_agnes1$label)
+cm_agnes2 <- ConfusionMatrix(cls_labels_agnes2$cluster, cls_labels_agnes2$label)
+
+cm_agnes1
+cm_agnes2
+
+micro_matrix(cm_agnes1)
+micro_matrix(cm_agnes1)
+```
+
+
+# 3. Classification
+## 3.1. Data preprocessing
+```{r split_sample, echo = TRUE, warning= FALSE, message = FALSE}
+set.seed(123)
+# split the training and testing data
+split <- sample.split(features, SplitRatio=0.8)
+features_train <- subset(features, split==TRUE)
+features_test <- subset(features, split==FALSE)
+```
+
+```{r data_preprocessing, echo=TRUE, message=FALSE, warning=FALSE}
+features_train_clean <- features_train[, -c(1,2)]
+features_test_clean <- features_test[, -c(1,2)]
+
+# remove columns with all zeros in training and testing set
+train_max <- apply(features_train_clean[, -1], 2, max)
+test_max <- apply(features_test_clean[, -1], 2, max)
+col_zeros <- c(names(which(train_max==0)), names(which(test_max==0)))
+features_train_clean <- select(features_train_clean, -(col_zeros))
+features_test_clean <- select(features_test_clean, -(col_zeros))
+
+# add the chunk column to the training set for 10-fold cross-validation
+set.seed(123)
+K <- 10
+n <- nrow(features_train_clean)
+n_tail <- n%/%K
+rnd_n <- runif(n)
+rank_n <- rank(rnd_n)
+chunk <- (rank_n - 1)%/%n_tail + 1
+chunk <- as.factor(chunk)
+
+features_train_clean$chunk <- chunk
+
+```
+
+
+## 3.2. k nearest neighbor (kNN)
+```{r preprocessing_kNN, echo = TRUE, warning= FALSE, message = FALSE}
+library(class)
+
+# define a function with k (the number of neighbours included) as the input to apply kNN with 10-fold cross-validation
+knn_fun <- function(knn_k){
+  cv_knn <- numeric(0)
+  # 10-folder cross-validation
+  for (k in 1:K) {
+    knn_train_pred <- knn(train = select(features_train_clean[chunk != k, ], -c(label, chunk)),
+                       test = select(features_train_clean[chunk == k, ], -c(label, chunk)),
+                       cl = features_train_clean[chunk != k, ]$label, k=knn_k)
+    cv_knn <- rbind(cv_knn, macro_matrix(knn_train_pred, features_train_clean[chunk == k, ]$label))
+  }
+  # calculate the average evaluation metrics of 10 models
+  cv_knn <- rbind(cv_knn, apply(cv_knn, 2, mean))
+  rownames(cv_knn)[11] <- "mean"
+  return(cv_knn)
+}
+```
+### 3.2.1. Hyperparameter set 1
+```{r hp_set1_knn, echo = TRUE, warning= FALSE, message = FALSE}
+# hyperparameter set 1
+# set the k as the square root of the number of training set samples
+knn_sqrn <- floor(sqrt(nrow(features_train_clean)))
+
+# run the model with 10-fold cross-validation and measure the running time
+start_time <- Sys.time()
+cv_knn_sqrn <- knn_fun(knn_sqrn)
+end_time <- Sys.time()
+
+# get the running time and evaluation metrics 
+end_time - start_time
+cv_knn_sqrn
+```
+### 3.2.2. Hyperparameter set 2
+```{r hp_set2_knn, echo = TRUE, warning= FALSE, message = FALSE}
+# hyperparameter set 2
+# set the k as half of the knn_sqrn
+knn_sqrn_half <- knn_sqrn * 0.5
+
+# run the model with 10-fold cross-validation and measure the running time
+start_time <- Sys.time()
+cv_knn_sqrn_half <- knn_fun(knn_sqrn_half)
+end_time <- Sys.time()
+
+# get the running time and evaluation metrics 
+end_time - start_time
+cv_knn_sqrn_half
+```
+### 3.2.3. Hyperparameter set 3
+```{r hp_set3_knn, echo = TRUE, warning= FALSE, message = FALSE}
+# hyperparameter set 3
+# set the k as twice of the knn_sqrn
+knn_sqrn_double <- knn_sqrn * 2
+
+# run the model with 10-fold cross-validation and measure the running time
+start_time <- Sys.time()
+cv_knn_sqrn_double <- knn_fun(knn_sqrn_double)
+end_time <- Sys.time()
+
+# get the running time and evaluation metrics 
+end_time - start_time
+cv_knn_sqrn_double
+```
+### 3.2.4. Predict the test data
+```{r model_selection_kNN, echo = TRUE, warning= FALSE, message = FALSE}
+# check the model performance on the test set
+# k = knn_sqrn (hyperparameter set 1) has the best performance based on the results of 10-fold cross-validation
+start_time <- Sys.time()
+knn_test_pred <- knn(train = select(features_train_clean, -c(label, chunk)),
+                     test = select(features_test_clean, -label),
+                     cl = features_train_clean$label, k=knn_sqrn)
+end_time <- Sys.time()
+time_knn <- end_time - start_time
+time_knn
+# evaluate the performances of the selected model
+cm_knn <- confusionMatrix(knn_test_pred, as.factor(features_test_clean$label))
+cm_knn
+
+macro_knn <- macro_matrix(knn_test_pred, features_test_clean$label)
+macro_knn
+```
+
+
+## 3.3. Decision tree (DT)
+```{r preprocessing_DT, echo = TRUE, warning= FALSE, message = FALSE}
+library(rpart)
+
+# define a function to apply decision tree with 10-fold cross-validation
+dt_fun <- function(control){
+  cv_dt <- numeric(0)
+  # 10-folder cross-validation
+  for(k in 1:K){
+    dt <- rpart(label~., data=select(features_train_clean[chunk != k, ], -chunk), 
+                method = "class", control = control)
+    dt_train_pred <- predict(dt, select(features_train_clean[chunk == k, ], -c(label, chunk)), type="class")
+    cv_dt <- rbind(cv_dt, macro_matrix(dt_train_pred, features_train_clean[chunk == k, ]$label))
+  }
+  # calculate the average evaluation metrics of 10 models
+  cv_dt <- rbind(cv_dt, apply(cv_dt, 2, mean))
+  rownames(cv_dt)[11] <- "mean"
+  return(cv_dt)
+}
+
+# build a fully-grown tree as a benchmark
+start_time <- Sys.time()
+cv_dt_full <- dt_fun()
+end_time <- Sys.time()
+cv_dt_full
+end_time - start_time
+```
+### 3.3.1. Hyperparameter set 1
+```{r hp_set1_DT, echo = TRUE, warning= FALSE, message = FALSE}
+# hyperparameter 1
+# set the minsplit as twice of the default value (20) to fine the tree
+dt_ctrl1 <- rpart.control(minsplit=40)
+
+# run the model with 10-fold cross-validation and measure the running time
+start_time <- Sys.time()
+cv_dt_fine1 <- dt_fun(dt_ctrl1)
+end_time <- Sys.time()
+
+# get the running time and evaluation metrics 
+end_time - start_time
+cv_dt_fine1
+```
+### 3.3.2. Hyperparameter set 2
+```{r hp_set2_DT, echo = TRUE, warning= FALSE, message = FALSE}
+# hyperparameter 2
+# add maxdepth to the model
+dt_ctrl2 <- rpart.control(minsplit=40, maxdepth = 5)
+
+# run the model with 10-fold cross-validation and measure the running time
+start_time <- Sys.time()
+cv_dt_fine2 <- dt_fun(dt_ctrl2)
+end_time <- Sys.time()
+
+# get the running time and evaluation metrics 
+end_time - start_time
+cv_dt_fine2
+```
+### 3.3.3. Hyperparameter set 3
+```{r hp_set3_DT, echo = TRUE, warning= FALSE, message = FALSE}
+# hyperparameter 3
+# This hyperparameter set is applied following the same steps with the dt_fun, but a post-pruning is used in the middle of the function, so I add this step here
+
+# run the model with 10-fold cross-validation and measure the running time
+cv_dt_fine3 <- numeric(0)
+start_time <- Sys.time()
+for(k in 1:K){
+  dt <- rpart(label~., data=select(features_train_clean[chunk != k, ], -chunk),
+              method = "class")
+  # post-prune the tree by specifying cp
+  dt_fit <- prune(dt, cp=dt$cptable[which.min(dt$cptable[,"xerror"]),"CP"])
+  dt_train_pred <- predict(dt_fit, select(features_train_clean[chunk == k, ], -c(label, chunk)), type="class", control = rpart.control(minsplit = 40, maxdepth = 5))
+  cv_dt_fine3 <- rbind(cv_dt_fine3, macro_matrix(dt_train_pred, features_train_clean[chunk == k, ]$label))
+}
+end_time <- Sys.time()
+cv_dt_fine3 <- rbind(cv_dt_fine3, apply(cv_dt_fine3, 2, mean))
+# calculate the average evaluation metrics of 10 models
+rownames(cv_dt_fine3)[11] <- "mean"
+
+# get the running time and evaluation metrics 
+end_time - start_time
+cv_dt_fine3
+```
+### 3.3.4. Predict the test data
+```{r model_selection_DT, echo = TRUE, warning= FALSE, message = FALSE}
+# check the model performance on the test set
+# minsplit=40, maxdepth=5 (hyperparameter set 2) has the best performance based on the results of 10-fold cross-validation
+start_time <- Sys.time()
+dt <- rpart(label~., data=select(features_train_clean, -chunk), 
+              method = "class", control = rpart.control(minsplit=40, maxdepth = 5))
+dt_test_pred <- predict(dt, select(features_test_clean, -label), type="class")
+end_time <- Sys.time()
+time_dt <- end_time - start_time
+time_dt
+
+# evaluate the performances of the selected model
+cm_dt <- confusionMatrix(dt_test_pred, as.factor(features_test_clean$label))
+cm_dt
+
+macro_dt <- macro_matrix(dt_test_pred, features_test_clean$label)
+macro_dt
+```
+
+## 3.4. Random forest (RF)
+```{r preprocessing_RF, echo = TRUE, warning= FALSE, message = FALSE}
+library(randomForest)
+
+# define a function with the number of trees to grow as the input to apply random forest with 10-fold cross-validation
+rf_fun <- function(tree_n){
+  cv_rf <- numeric(0)
+  # 10-folder cross-validation
+  for(k in 1:K){
+    rf <- randomForest(as.factor(label)~., data=select(features_train_clean[chunk != k, ], -chunk),
+                       importance=TRUE, proximity=TRUE, ntree = tree_n)
+    rf_train_pred <- predict(rf, select(features_train_clean[chunk == k, ], -c(label, chunk)), type="class")
+    cv_rf <- rbind(cv_rf, macro_matrix(rf_train_pred, features_train_clean[chunk == k, ]$label))
+  }
+  # calculate the average evaluation metrics of 10 models
+  cv_rf <- rbind(cv_rf, apply(cv_rf, 2, mean))
+  rownames(cv_rf)[11] <- "mean"
+  return(cv_rf)
+}
+```
+### 3.4.1. Hyperparameter set 1
+```{r hp_set1_RF, echo = TRUE, warning= FALSE, message = FALSE}
+# hyperparameter set 1
+# set the number of trees as 256
+tree_n1 <- 256
+
+# run the model with 10-fold cross-validation and measure the running time
+start_time <- Sys.time()
+cv_rf1 <- rf_fun(tree_n1)
+end_time <- Sys.time()
+
+# get the running time and evaluation metrics 
+end_time - start_time
+cv_rf1
+```
+
+### 3.4.2. Hyperparameter set 2
+```{r hp_set2_RF, echo = TRUE, warning= FALSE, message = FALSE}
+# hyperparameter set 2
+# set the number of trees as 128
+tree_n2 <- 128
+
+# run the model with 10-fold cross-validation and measure the running time
+start_time <- Sys.time()
+cv_rf2 <- rf_fun(tree_n2)
+end_time <- Sys.time()
+
+# get the running time and evaluation metrics 
+end_time - start_time
+cv_rf2
+```
+
+### 3.4.3. Hyperparameter set 3
+```{r hp_set3_RF, echo = TRUE, warning= FALSE, message = FALSE}
+# hyperparameter set 3
+# set the number of trees as 64
+tree_n3 <- 64
+
+# run the model with 10-fold cross-validation and measure the running time
+start_time <- Sys.time()
+cv_rf3 <- rf_fun(tree_n3)
+end_time <- Sys.time()
+
+# get the running time and evaluation metrics 
+end_time - start_time
+cv_rf3
+```
+
+### 3.4.4. Predict the test data
+```{r model_selection_RF, echo = TRUE, warning= FALSE, message = FALSE}
+# check the model performance on the test set
+# ntree=64 (hyperparameter set 3) has the best performance based on the results of 10-fold cross-validation
+start_time <- Sys.time()
+rf <- randomForest(as.factor(label)~., data=select(features_train_clean, -chunk),
+                   importance=TRUE, proximity=TRUE, ntree = 64)
+rf_test_pred <- predict(rf, select(features_test_clean, -label), type="class")
+end_time <- Sys.time()
+time_rf <- end_time - start_time
+time_rf
+
+# evaluate the performances of the selected model
+cm_rf <- confusionMatrix(rf_test_pred, as.factor(features_test_clean$label))
+cm_rf
+
+macro_rf <- macro_matrix(rf_test_pred, as.factor(features_test_clean$label))
+macro_rf
+```
+
+
+## 3.5. Artificial neural network (ANN)
+```{r preprocessing_ANN, echo = TRUE, warning= FALSE, message = FALSE}
+# find the columns of highly correlated features
+col_cor <- findCorrelation(select(features_train_clean, -c(label, chunk)), cutoff = 0.9)
+
+# define a function to normalize values between 0 and 1
+scl <- function(x){ (x - min(x))/(max(x) - min(x)) }
+
+# preprocess training and testing set
+features_train_clean_norm <- select(features_train_clean, -c(label, chunk)) %>%
+  select(-col_cor) %>%   # remove highly correlated features
+  apply(2, scl) %>%   # normalize features between 0 and 1
+  as.data.frame() %>%
+  mutate(label=features_train_clean$label)
+
+features_test_clean_norm <- select(features_test_clean, -c(label)) %>%
+  select(-col_cor) %>%   # remove highly correlated features
+  apply(2, scl) %>%   # normalize features between 0 and 1
+  as.data.frame() %>%
+  mutate(label=features_test_clean$label)
+
+
+# define one-hot encoding function
+dummy_train <- dummyVars(" ~ .", data=features_train_clean_norm)
+dummy_test <- dummyVars(" ~ .", data=features_test_clean_norm)
+
+# perform one-hot encoding on data frame
+features_train_clean_norm <- data.frame(predict(dummy_train, newdata=features_train_clean_norm))
+features_test_clean_norm <- data.frame(predict(dummy_test, newdata=features_test_clean_norm))
+
+# rename the label columns
+colnames(features_train_clean_norm)[(ncol(features_train_clean_norm)-1):ncol(features_train_clean_norm)] <- c('NR', 'R')
+colnames(features_test_clean_norm)[(ncol(features_test_clean_norm)-1):ncol(features_test_clean_norm)] <- c('NR', 'R')
+
+# add the chunk column to the dataset features_train_clean_norm
+features_train_clean_norm$chunk <- features_train_clean$chunk
+
+# define the formula by concatenating strings
+features_f <- paste(colnames(features_train_clean_norm)[1:(ncol(features_train_clean_norm)-3)],collapse=' + ')
+features_f <- paste('NR + R ~',features_f)
+
+# convert to formula
+features_f <- as.formula(features_f)
+
+```
+
+### 3.5.1. Hyperparameter set 1
+```{r hp_set1_ANN, echo = TRUE, warning= FALSE, message = FALSE}
+# hyperparameter set 1
+# apply artificial neural network with 10-fold cross-validation
+cv_ann1 <- numeric(0)
+start_time <- Sys.time()
+for (k in 1:K) {
+  # train neural networks
+  features_nn <- neuralnet(formula=features_f, data=select(features_train_clean_norm[chunk != k, ], -chunk), hidden=c(8,5), linear.output=FALSE)
+  # compute the prediction
+  features_train_predict.nn <- compute(features_nn, select(features_train_clean_norm[chunk == k, ], -c(chunk, NR, R)))
+  # extract prediction results as numeric
+  features_train_pred.nn_val <- features_train_predict.nn$net.result
+  # ground truth
+  features_train_original_values <- max.col(select(features_train_clean_norm[chunk == k, ], c(NR, R)))
+  # Predicted 
+  features_train_pred.nn_label <- max.col(features_train_pred.nn_val)
+  # evaluate the performances of each model
+  cv_ann1 <- rbind(cv_ann1, macro_matrix(features_train_pred.nn_label, features_train_original_values))
+}
+end_time <- Sys.time()
+cv_ann1 <- rbind(cv_ann1, apply(cv_ann1, 2, mean))
+rownames(cv_ann1)[11] <- "mean"
+
+# get the running time and evaluation metrics 
+end_time - start_time
+cv_ann1
+```
+
+### 3.5.2. Hyperparameter set 2
+```{r hp_set2_ANN, echo = TRUE, warning= FALSE, message = FALSE}
+# hyperparameter set 2
+# apply artificial neural network with 10-fold cross-validation
+cv_ann2 <- numeric(0)
+start_time <- Sys.time()
+for (k in 1:K) {
+  # train neural networks
+  features_nn <- neuralnet(formula=features_f, data=select(features_train_clean_norm[chunk != k, ], -chunk), hidden=c(4,4,5), linear.output=FALSE)
+  # compute the prediction
+  features_train_predict.nn <- compute(features_nn, select(features_train_clean_norm[chunk == k, ], -c(chunk, NR, R)))
+  # extract prediction results as numeric
+  features_train_pred.nn_val <- features_train_predict.nn$net.result
+  # ground truth
+  features_train_original_values <- max.col(select(features_train_clean_norm[chunk == k, ], c(NR, R)))
+  # Predicted 
+  features_train_pred.nn_label <- max.col(features_train_pred.nn_val)
+  # evaluate the performances of each model
+  cv_ann2 <- rbind(cv_ann2, macro_matrix(features_train_pred.nn_label, features_train_original_values))
+}
+end_time <- Sys.time()
+cv_ann2 <- rbind(cv_ann2, apply(cv_ann2, 2, mean))
+rownames(cv_ann2)[11] <- "mean"
+
+# get the running time and evaluation metrics 
+end_time - start_time
+cv_ann2
+```
+
+### 3.5.3. Hyperparameter set 3
+```{r hp_set3_ANN, echo = TRUE, warning= FALSE, message = FALSE}
+# hyperparameter set 3
+# apply artificial neural network with 10-fold cross-validation
+cv_ann3 <- numeric(0)
+start_time <- Sys.time()
+for (k in 1:K) {
+  # train neural networks
+  features_nn <- neuralnet(formula=features_f, data=select(features_train_clean_norm[chunk != k, ], -chunk), hidden=c(8,6,5), linear.output=FALSE)
+  # compute the prediction
+  features_train_predict.nn <- compute(features_nn, select(features_train_clean_norm[chunk == k, ], -c(chunk, NR, R)))
+  # extract prediction results as numeric
+  features_train_pred.nn_val <- features_train_predict.nn$net.result
+  # ground truth
+  features_train_original_values <- max.col(select(features_train_clean_norm[chunk == k, ], c(NR, R)))
+  # Predicted 
+  features_train_pred.nn_label <- max.col(features_train_pred.nn_val)
+  # evaluate the performances of each model
+  cv_ann3 <- rbind(cv_ann3, macro_matrix(features_train_pred.nn_label, features_train_original_values))
+}
+end_time <- Sys.time()
+cv_ann3 <- rbind(cv_ann3, apply(cv_ann3, 2, mean))
+rownames(cv_ann3)[11] <- "mean"
+
+# get the running time and evaluation metrics 
+end_time - start_time
+cv_ann3
+```
+
+### 3.5.4. Predict the test data
+```{r model_selection_ANN, echo = TRUE, warning= FALSE, message = FALSE}
+# check the model performance on the test set
+# hidden=c(8,5) (hyperparameter set 1) has the best performance based on the results of 10-fold cross-validation
+start_time <- Sys.time()
+ # train neural networks
+features_nn <- neuralnet(formula=features_f, data=select(features_train_clean_norm, -chunk), hidden=c(8,5), linear.output=FALSE)
+# compute the prediction
+features_test_pred.nn <- compute(features_nn, select(features_test_clean_norm, -c(NR, R)))
+# extract prediction results
+features_test_pred.nn_val <- features_test_pred.nn$net.result
+# ground truth
+features_test_original_values <- max.col(select(features_test_clean_norm, c(NR, R)))
+# predicted 
+features_test_pred.nn_label <- max.col(features_test_pred.nn_val)
+end_time <- Sys.time()
+time_ann <- end_time - start_time
+time_ann
+
+# evaluate the performances of the selected model
+cm_ann <- confusionMatrix(as.factor(features_train_pred.nn_label), as.factor(features_train_original_values))
+cm_ann
+
+macro_ann <- macro_matrix(features_train_pred.nn_label, features_train_original_values)
+macro_ann
+```
+
+
+## 3.6. Comparison of models generated by four algorithms
+```{r comparison, echo = TRUE, warning= FALSE, message = FALSE}
+# create a dataframe to compare the performances of four algorithms
+compare_df <- data.frame(cbind(c(time_knn, time_dt, time_rf, time_ann),rbind(macro_knn, macro_dt, macro_rf, macro_ann)))
+colnames(compare_df)[1] <- "running_time"
+rownames(compare_df) <- c("knn", "dt", "rf", "ann")
+
+compare_df
+
+```
