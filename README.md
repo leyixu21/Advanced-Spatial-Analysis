@@ -1,5 +1,5 @@
-# GEO-881-Advanced-Spatial-Analysis-II
-GEO881_Advanced Spatial Analysis
+# Advanced-Spatial-Analysis
+Advanced Spatial Analysis
 
 Data Challenge 1: use the NYC Citibikes dataset to showcase geographical data analysis
 
