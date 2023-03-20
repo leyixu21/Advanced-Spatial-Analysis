@@ -1,0 +1,249 @@
+---
+title: "Data Challenge 1"
+author: "Leyi Xu"
+date: '2022-02-25'
+output: 
+  html_document:
+    code_folding: show
+    fig_caption: yes
+    highlight: tango
+    number_sections: no
+    theme: journal
+    toc: yes
+    toc_depth: 2
+    toc_float: yes
+fig_width: 6
+---
+
+<style>
+body {text-align: justify}
+</style>
+
+# Preliminaries
+```{r echo=FALSE, message=FALSE, warning=TRUE}
+
+# ------------------------------------------------------------------------------
+options(scipen = 5000)
+options(digits.secs = 4)
+options(warning = FALSE)
+
+
+# ------------------------------------------------------------------------------
+# packages:
+
+## Default repository
+local({r <- getOption("repos")
+       r["CRAN"] <- "http://cran.r-project.org" 
+       options(repos=r)
+})
+
+check_pkg <- function(x)
+  {
+    if (!require(x, character.only = TRUE, quietly = TRUE))
+    {
+      install.packages(x, dep = TRUE, verbose = FALSE, quiet = TRUE)
+        if(!require(x, character.only = TRUE, quietly = TRUE)) stop("Package not found")
+    }
+}
+
+check_pkg("tidyverse")
+check_pkg("sf")
+check_pkg("ggplot2")
+check_pkg("tmap")
+check_pkg("geosphere")
+check_pkg("here")
+
+
+here::i_am("Data Challenge 1_Leyi Xu.Rmd")
+```
+
+
+# 1. How many trips are reported in the data?
+```{r load_data, echo = TRUE, warning= FALSE, message = FALSE}
+# Load citibike data
+citibike <- read.csv("201903-citibike-tripdata.csv")
+
+citibike_num <- nrow(citibike)
+```
+There are `r citibike_num` trips reported in the data.
+
+# 2. What is the earliest time of the day any trip starts?
+```{r earliest_time, echo = TRUE, warning= FALSE, message = FALSE}
+library(lubridate)
+
+citibike <- citibike %>%
+  # add the column start_time which converts character into a date-time format
+  mutate(start_time = as.POSIXct(starttime, format="%Y-%m-%d%H:%M:%OS")) %>%
+  # add the column date which extracts year, month and date from date-time
+  mutate(start_date = as_date(starttime)) %>%
+  # add the column hms which extracts hour, minute and second from date-time
+  mutate(start_hms = format(start_time, "%H:%M:%OS"))
+
+# sort the time by order and select the first (earliest) one
+earliest_time <- sort(citibike$start_hms)[1]
+```
+The earliest time of the day any trip starts is `r earliest_time`.
+
+# 3.  How many stations are used?
+```{r stations, echo = TRUE, warning= FALSE, message = FALSE}
+library(dplyr)
+
+# Collect all the stations used (start stations + end stations)
+stations = data.frame(stations = c(citibike$start.station.id, citibike$end.station.id))
+stations = stations %>%
+  # filter out the null
+  filter(!stations == "NULL") %>%
+  # delete duplicated stations
+  unique()
+
+stations_num <- length(stations$stations)
+```
+There are `r stations_num` stations used.
+
+# 4. What is the mean number of trips per day?
+```{r trips_per_day, echo = TRUE, warning= FALSE, message = FALSE}
+# count the number of trips each day
+trips <- citibike %>%
+  group_by(start_date) %>%
+  summarise(count = n())
+
+# calculate the mean number of trips per day
+trips_mean_perday <- mean(trips$count)
+```
+The mean number of trips per day is about `r trips_mean_perday`
+
+# 5. What is the mean number of trips on Sundays?
+```{r trips_Sundays, echo = TRUE, warning= FALSE, message = FALSE}
+# get the day of week from the date
+trips <- trips %>%
+  mutate(wd = wday(start_date))
+
+# filter Sundays
+trips_sundays <- trips %>%
+  filter(wd == 1)
+
+# calculate the mean number of trips on Sundays
+trips_mean_sundays <- mean(trips_sundays$count)
+```
+The mean number of trips on Sundays is about `r trips_mean_sundays`
+
+# 6. On which day did most trips start?
+```{r most_trips, echo = TRUE, warning= FALSE, message = FALSE}
+# filter the day with most trips
+trips_max <- trips %>%
+  filter(count == max(count))
+
+# get the date
+trips_max_date <- trips_max$start_date
+```
+Most trips start on `r trips_max_date`.
+
+# 7. That day, how many trips started between 11:00 and 15:00?
+```{r trips_11_15, echo = TRUE, warning= FALSE, message = FALSE}
+# get the trips started between 11:00 and 15:00 on 2019-03-30
+trips_11_15 <- citibike %>%
+  filter(start_date == trips_max_date) %>%
+  filter(start_hms >= "11:00:00.0000" & start_hms <= "15:00:00.0000")
+
+trips_11_15_num <- nrow(trips_11_15)
+```
+There are `r trips_11_15_num` trips between 11:00 and 15:00 on `r trips_max_date`.
+
+# 8. What is the duration of the longest trip?
+```{r trips_duration, echo = TRUE, warning= FALSE, message = FALSE}
+# get the maximum of tripduration and convert seconds to days
+duration_longest <- max(citibike$tripduration)/86400
+```
+The longest trip lasted for about 34 days.
+
+# 9. What is the 99% quantile of trip durations?
+```{r quantile_99, echo = TRUE, warning= FALSE, message = FALSE}
+quantile_99 <- quantile(citibike$tripduration, probs = .99)/60
+```
+The 99% quantile of trip durations is about `r quantile_99` minutes.
+
+# 10. Plot a histogram of all trips shorter than 45 minutes.
+```{r hist_plot, echo = TRUE, warning= FALSE, message = FALSE}
+# get trips shorter than 45 minutes
+trips_45 <- citibike %>%
+  mutate(tripduration = round(tripduration/60)) %>%
+  filter(tripduration < 45)
+
+# plot the histogram
+ggplot(trips_45, aes(x = tripduration)) +
+  geom_histogram(binwidth = 1) +
+  xlab("Trip duration in minutes") + ylab("Number of trips") +
+  ggtitle("Trip duration in March")
+  
+```
+
+# 11. What is the median beeline distance travelled?
+```{r median, echo = TRUE, warning= FALSE, message = FALSE}
+library(geosphere)
+
+# calculate the travel distance between start and end stations
+citibike$dist<-distGeo(data.frame(citibike$start.station.longitude, citibike$start.station.latitude), 
+                       data.frame(citibike$end.station.longitude, citibike$end.station.latitude))
+
+# get the median of travel distance
+dist_median <- median(citibike$dist)
+```
+The median distance travelled is `r dist_median`m.
+
+# 12. Generate a sub-sample containing a random 10% of the data, and for that subsample plot the time to ride the (beeline) distance.
+```{r plot_time_distance, echo = TRUE, warning= FALSE, message = FALSE}
+# get the extreme values in trip duration
+extreme_high <- quantile(citibike$tripduration, probs = .75) + 1.5*IQR(citibike$tripduration)
+
+# extreme_low <- quantile(citibike$tripduration, probs = .25) - 1.5*IQR(citibike$tripduration)
+
+# filter out the objects with extreme values in trip duration
+citibike_new <- citibike %>%
+  filter(tripduration < extreme_high)
+
+# select random 10% of citibike as a sub-sample
+citibike_sample <- citibike_new[sample(nrow(citibike_new), nrow(citibike_new)*0.1), ]
+
+# plot the time to distance
+ggplot(citibike_sample, aes(x = dist, y = tripduration)) +
+  geom_point(size = 0.1) +
+  coord_fixed(ratio= 7) +
+  xlab("Beeline distance [m]") + ylab("Trip duration [s]") +
+  ggtitle("Trip duration by distance covered")
+```
+
+# 13. Plot a map indicating the 10 most and least active stations.
+```{r plot_stations, echo = TRUE, warning= FALSE, message = FALSE}
+# create start stations sf object and end stations sf objects according to their latitudes and longitudes
+start_sf = st_as_sf(citibike, coords = c("start.station.longitude", "start.station.latitude"), crs = 4326)
+end_sf = st_as_sf(citibike, coords = c("end.station.longitude", "end.station.latitude"), crs = 4326)
+
+# get all stations (start stations and end stations)
+stations_all <- st_as_sf(data.frame(id = c(start_sf$start.station.id, end_sf$end.station.id), geometry = c(start_sf$geometry, end_sf$geometry)))
+
+# count how many times each station is used
+stations_all_count <- stations_all %>%
+  filter(!id == "NULL") %>%
+  group_by(id) %>%
+  summarise(count = n())
+
+# get the 10 most and least active stations
+stations_active <- rbind(stations_all_count[order(stations_all_count$count), ][1:10, ],
+                         stations_all_count[order(stations_all_count$count, decreasing = TRUE), ][1:10, ])
+
+# add the column active to indicate each station is active or not
+stations_active$active <- "no"
+stations_active$active[11:20] <- "yes"
+
+# rescale the count as radius to visualize the 10 most and least active stations
+stations_active$radius <- stations_active$count
+stations_active$radius[11:20] <- stations_active$count[11:20]/20
+
+
+# plot the map
+tmap_mode("view")
+
+tm_shape(stations_active) + 
+  tm_dots(size = "radius", col = "active", palette = "Dark2", alpha = 0.8) +
+  tm_basemap("Stamen")
+```
