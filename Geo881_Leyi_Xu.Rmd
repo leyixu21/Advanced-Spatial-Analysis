@@ -1,0 +1,1285 @@
+---
+title: "GEO881 Data Challenge 3"
+author: "Leyi Xu"
+date: '2022-06-16'
+output: 
+  html_document:
+    code_folding: show
+    fig_caption: yes
+    highlight: tango
+    number_sections: no
+    theme: journal
+    toc: yes
+    toc_depth: 2
+    toc_float: yes
+fig_width: 6
+---
+
+<style>
+body {text-align: justify}
+</style>
+
+# Preliminaries and read data
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+# ------------------------------------------------------------------------------
+options(scipen = 5000)
+options(digits.secs = 4)
+options(warning = FALSE)
+options(max.print=1000000) 
+
+# ------------------------------------------------------------------------------
+# packages:
+
+## Default repository
+local({r <- getOption("repos")
+       r["CRAN"] <- "http://cran.r-project.org" 
+       options(repos=r)
+})
+
+check_pkg <- function(x)
+  {
+    if (!require(x, character.only = TRUE, quietly = TRUE))
+    {
+      install.packages(x, dep = TRUE, verbose = FALSE, quiet = TRUE)
+        if(!require(x, character.only = TRUE, quietly = TRUE)) stop("Package not found")
+    }
+}
+
+check_pkg("tidyverse")
+check_pkg("tidyr")
+check_pkg("tidygraph")
+check_pkg("sf")
+check_pkg("ggplot2")
+check_pkg("ggraph")
+check_pkg("ggfortify")
+check_pkg("tmap")
+check_pkg("igraph")
+check_pkg("feasts")
+check_pkg("lubridate")
+check_pkg("tsibble")
+check_pkg("fable")
+check_pkg("urca")
+check_pkg("forecast")
+check_pkg("zoo")
+check_pkg("xts")
+check_pkg("simts")
+check_pkg("changepoint")
+check_pkg("strucchange")
+check_pkg("here")
+
+here::i_am("Geo881_Leyi_Xu.Rmd")
+
+```
+
+
+```{r read_data, echo = TRUE, warning= FALSE, message = FALSE}
+# read network data
+zurich <- read.csv("data/network-analysis/zurich_street.csv")
+newyork <- read.csv("data/network-analysis/newyork_street.csv")
+
+zurich_street <- st_read("data/network-analysis/shapefile/zurich/zurich_street.shp")
+zurich_node <- st_read("data/network-analysis/shapefile/zurich/zurich_node.shp")
+newyork_street <- st_read("data/network-analysis/shapefile/newyork/newyork_street.shp")
+newyork_node <- st_read("data/network-analysis/shapefile/newyork/newyork_nodes.shp")
+
+
+# read time series data
+# zurich_ped_2019 <- read.csv("data/time-series/zurich_ped_count_daily_U15G3063864_2019.csv")
+AirPassengers <- AirPassengers
+zurich_ped_2020 <- read.csv("data/time-series/zurich_ped_count_daily_U15G3063864_2020.csv")
+# convert character to date
+# zurich_ped_2019$DATE <- as.Date(zurich_ped_2019$DATE, "%Y-%m-%d")
+zurich_ped_2020$DATE <- as.Date(zurich_ped_2020$DATE, "%Y-%m-%d")
+
+```
+
+# 1. Explore the data
+```{r explore_data, echo = TRUE, warning= FALSE, message = FALSE}
+# explore network data
+print("Number of streets in Zurich")
+nrow(zurich_street)
+print("Number of street intersections in Zurich")
+nrow(zurich_node)
+print("Summary of street lengths in Zurich")
+summary(zurich$seg_length)
+
+print("Number of streets in New York")
+nrow(newyork_street)
+print("Number of street intersections in New York")
+nrow(newyork_node)
+print("Summary of street lengths in New York")
+summary(newyork$seg_length)
+
+# map the street segments and intersections
+tmap_mode("view")
+
+# map Zurich
+tm_shape(zurich_street) + tm_lines(lwd = 1.5) +
+  tm_shape(zurich_node) + tm_dots(size = 0.01, col = "red")
+
+# map New York
+tm_shape(newyork_street) + tm_lines(lwd = 1.5) +
+  tm_shape(newyork_node) + tm_dots(size = 0.01, col = "red")
+
+
+# explore time series data
+print("summary of AirPassengers data")
+summary(AirPassengers)
+
+plot(AirPassengers)
+
+# create a box plot by cycle
+boxplot(AirPassengers~cycle(AirPassengers), xlab="Date", ylab = "Passenger Numbers (1000's)", main = "Monthly air passengers boxplot from 1949-1960")
+
+
+print("summary of Zurich pedestrian count in 2020")
+
+summary(zurich_ped_2020)
+
+# plot the Zurich pedestrians 2020 data
+ggplot(data = zurich_ped_2020, aes(DATE, PED_TOTAL)) + geom_line()
+
+boxplot(zurich_ped_2020$PED_TOTAL ~ reorder(format(zurich_ped_2020$DATE,'%B'),zurich_ped_2020$DATE), outline = FALSE, xlab="Date", ylab = "Passenger Numbers", main = "Monthly passengers flow in Zurich boxplot in 2020")
+
+```
+
+
+# 2. Network analysis
+## 2.1. create street graphs and dual graphs
+Preprocess the network data
+```{r preprocess_network_data, echo = TRUE, warning= FALSE, message = FALSE}
+# filter longer street segments which share the same start and end nodes in Zurich
+zurich_s <- unique(zurich$s)
+for (i in zurich_s) {
+  zurich_s_e <- zurich[zurich$s == i, "e"]
+  zurich_e_duplicated <- unique(zurich_s_e[duplicated(zurich_s_e)])
+  for (j in zurich_e_duplicated) {
+    zurich_filter <- zurich[(zurich$s == i & zurich$e == j), ]
+    length_max <- max(zurich_filter$seg_length)
+    FID_remove <- zurich_filter[zurich_filter$seg_length == length_max, "FID"]
+    zurich <- zurich[zurich$FID != FID_remove,]
+  }
+}
+# the number of street segments in Zurich
+nrow(zurich)
+
+# filter longer street segments which share the same nodes in New York
+newyork_s <- unique(newyork$s)
+for (i in newyork_s) {
+  newyork_s_e <- newyork[newyork$s == i, "e"]
+  newyork_e_duplicated <- unique(newyork_s_e[duplicated(newyork_s_e)])
+  for (j in newyork_e_duplicated) {
+    newyork_filter <- newyork[(newyork$s == i & newyork$e == j), ]
+    length_max <- max(newyork_filter$seg_length)
+    FID_remove <- newyork_filter[newyork_filter$seg_length == length_max, "FID"]
+    newyork <- newyork[newyork$FID != FID_remove,]
+  }
+}
+# the number of street segments in New York
+nrow(newyork)
+```
+
+Create the street graph of Zurich
+```{r create_street_graph_zurich, echo = TRUE, warning= FALSE, message = FALSE}
+# get the edges and nodes of Zurich
+zurich_eg <- zurich[,c("s","e", "seg_length")]
+colnames(zurich_eg)[3] <- "weight"
+zurich_nd <- union(zurich_eg$s, zurich_eg$e)
+
+# create an undirected weighted street graph of Zurich
+zurich_street_graph <- igraph::graph_from_data_frame(zurich_eg, vertices = zurich_nd, directed = FALSE) %>% as_tbl_graph()
+is_weighted(zurich_street_graph)
+
+# plot the Zurich street graph
+zurich_street_graph %>% ggraph(layout = 'kk') + 
+    geom_edge_link() + 
+    geom_node_point(size = 2, colour = 'steelblue') +
+    ggtitle('Zurich street graph') + 
+    theme_graph()
+
+```
+
+Create the street graph of New York
+```{r create_street_graph_newyork, echo = TRUE, warning= FALSE, message = FALSE}
+# get the edges and nodes of New York
+newyork_eg <- newyork[,c("s","e", "seg_length")]
+colnames(newyork_eg)[3] <- "weight"
+newyork_nd <- union(newyork_eg$s, newyork_eg$e)
+
+# create an undirected weighted street graph of New York
+newyork_street_graph <- igraph::graph_from_data_frame(newyork_eg, vertices = newyork_nd, directed = FALSE) %>% as_tbl_graph()
+is_weighted(newyork_street_graph)
+
+# plot the New York street graph
+newyork_street_graph %>% ggraph(layout = 'kk') + 
+    geom_edge_link() + 
+    geom_node_point(size = 2, colour = 'steelblue') +
+    ggtitle('New York street graph') + 
+    theme_graph()
+
+```
+
+Create the dual graph of Zurich
+```{r create_dual_graph_zurich, echo = TRUE, warning= FALSE, message = FALSE}
+# get the edges of Zurich in a dual version
+zurich_nd_s <- zurich[, c("FID", "s")]
+names(zurich_nd_s) <- c("FID", "node")
+zurich_nd_e <- zurich[, c("FID", "e")]
+names(zurich_nd_e) <- c("FID", "node")
+zurich_nd_all <- rbind(zurich_nd_s, zurich_nd_e)
+zurich_eg_dual <- data.frame("s"=numeric(0), "e"=numeric(0))
+for (i in zurich_node$osmid) {
+  zurich_eg_selected <- zurich_nd_all[zurich_nd_all$node == i, "FID"]
+  if (length(zurich_eg_selected)>=2){
+    for (p in seq(1, length(zurich_eg_selected)-1)) {
+      zurich_eg_selected_rest <- zurich_eg_selected[(p+1):length(zurich_eg_selected)]
+      for (q in seq(1, length(zurich_eg_selected_rest))) {
+        zurich_eg_dual <- rbind(zurich_eg_dual, data.frame("s"=zurich_eg_selected[p], "e"=zurich_eg_selected_rest[q]))
+      }
+    }
+  }
+}
+
+# get the nodes of Zurich in a dual version
+zurich_nd_dual <- union(zurich_eg_dual$s, zurich_eg_dual$e)
+
+# create a dual street graph of Zurich
+zurich_dual_graph <- igraph::graph_from_data_frame(zurich_eg_dual, vertices = zurich_nd_dual, directed = FALSE) %>% as_tbl_graph()
+
+# plot the Zurich dual graph
+zurich_dual_graph %>% ggraph(layout = 'kk') + 
+    geom_edge_link() + 
+    geom_node_point(size = 2, colour = 'steelblue') +
+    ggtitle('Zurich dual graph') + 
+    theme_graph()
+
+```
+
+Create the dual graph of New York
+```{r create_dual_graph_newyork, echo = TRUE, warning= FALSE, message = FALSE}
+# get the edges of New York in a dual version
+newyork_nd_s <- newyork[, c("FID", "s")]
+names(newyork_nd_s) <- c("FID", "node")
+newyork_nd_e <- newyork[, c("FID", "e")]
+names(newyork_nd_e) <- c("FID", "node")
+newyork_nd_all <- rbind(newyork_nd_s, newyork_nd_e)
+newyork_eg_dual <- data.frame("s"=numeric(0), "e"=numeric(0))
+for (i in newyork_node$osmid) {
+  newyork_eg_selected <- newyork_nd_all[newyork_nd_all$node == i, "FID"]
+  if (length(newyork_eg_selected)>=2){
+    for (p in seq(1, length(newyork_eg_selected)-1)) {
+      newyork_eg_selected_rest <- newyork_eg_selected[(p+1):length(newyork_eg_selected)]
+      for (q in seq(1, length(newyork_eg_selected_rest))) {
+        newyork_eg_dual <- rbind(newyork_eg_dual, data.frame("s"=newyork_eg_selected[p], "e"=newyork_eg_selected_rest[q]))
+      }
+    }
+  }
+}
+
+# get the nodes of New York in a dual version
+newyork_nd_dual <- union(newyork_eg_dual$s, newyork_eg_dual$e)
+
+# create a dual street graph of New York
+newyork_dual_graph <- igraph::graph_from_data_frame(newyork_eg_dual, vertices = newyork_nd_dual, directed = FALSE) %>% as_tbl_graph()
+
+# plot the New York dual graph
+newyork_dual_graph %>% ggraph(layout = 'kk') + 
+    geom_edge_link() + 
+    geom_node_point(size = 1, colour = 'steelblue') +
+    ggtitle('New York dual graph') + 
+    theme_graph()
+
+```
+
+## 2.2. Centrality calculation of the graphs
+Calculate centralities of the Zurich street graph
+```{r centrality_street_graph_zurich, echo = TRUE, warning= FALSE, message = FALSE}
+# calculate the centrality of the Zurich street graph
+zurich_street_graph <- zurich_street_graph %>%
+  mutate(degree_weighted = centrality_degree(weights = zurich_eg$weight)) %>%   # calculate the weighted degree centrality
+  mutate(closeness_weighted = centrality_closeness(weights = zurich_eg$weight)) %>%   # calculate the weighted closeness centrality
+  mutate(betweenness_weighted = centrality_betweenness(weights = zurich_eg$weight)) %>%   # calculate the weighted betweenness centrality
+  mutate(degree_unweighted = centrality_degree()) %>%   # calculate the unweighted degree centrality
+  mutate(closeness_unweighted = centrality_closeness()) %>%   # calculate the unweighted closeness centrality
+  mutate(betweenness_unweighted = centrality_betweenness())   # calculate the unweighted betweenness centrality
+  
+
+
+# visualize the degree centrality of the weighted Zurich street graph
+zurich_street_graph %>%
+  ggraph(layout = 'kk') +
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = degree_weighted, colour = degree_weighted)) +
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Degree centrality of weighted Zurich street graph') +
+  theme_graph()
+
+# visualize the closeness centrality of the weighted Zurich street graph
+zurich_street_graph %>%
+  ggraph(layout = 'kk') +
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = closeness_weighted, colour = closeness_weighted)) +
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Closeness centrality of weighted Zurich street graph') +
+  theme_graph()
+
+
+# visualize the betweenness centrality of the weighted Zurich street graph
+zurich_street_graph %>%
+  ggraph(layout = 'kk') +
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = betweenness_weighted, colour = betweenness_weighted)) +
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Betweenness centrality of weighted Zurich street graph') +
+  theme_graph()
+
+
+
+# visualize the degree centrality of the unweighted Zurich street graph
+zurich_street_graph %>%
+  ggraph(layout = 'kk') +
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = degree_unweighted, colour = degree_unweighted)) +
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Degree centrality of unweighted Zurich street graph') +
+  theme_graph()
+
+# visualize the closeness centrality of the unweighted Zurich street graph
+zurich_street_graph %>%
+  ggraph(layout = 'kk') +
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = closeness_unweighted, colour = closeness_unweighted)) +
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Closeness centrality of unweighted Zurich street graph') +
+  theme_graph()
+
+
+# visualize the betweenness centrality of the unweighted Zurich street graph
+zurich_street_graph %>%
+  ggraph(layout = 'kk') +
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = betweenness_unweighted, colour = betweenness_unweighted)) +
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Betweenness centrality of unweighted Zurich street graph') +
+  theme_graph()
+
+```
+
+
+Calculate centralities of the New York street graph
+```{r centrality_street_graph_newyork, echo = TRUE, warning= FALSE, message = FALSE}
+# calculate the centrality of the New York street graph
+newyork_street_graph <- newyork_street_graph %>%
+  mutate(degree_weighted = centrality_degree(weights = newyork_eg$weight)) %>%   # calculate the weighted degree centrality
+  mutate(closeness_weighted = centrality_closeness(weights = newyork_eg$weight)) %>%   # calculate the weighted closeness centrality
+  mutate(betweenness_weighted = centrality_betweenness(weights = newyork_eg$weight)) %>%   # calculate the weighted betweenness centrality
+  mutate(degree_unweighted = centrality_degree()) %>%   # calculate the unweighted degree centrality
+  mutate(closeness_unweighted = centrality_closeness()) %>%   # calculate the unweighted closeness centrality
+  mutate(betweenness_unweighted = centrality_betweenness())   # calculate the unweighted betweenness centrality
+  
+
+
+# visualize the degree centrality of the weighted New York street graph
+newyork_street_graph %>%
+  ggraph(layout = 'kk') +
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = degree_weighted, colour = degree_weighted)) +
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Degree centrality of weighted New York street graph') +
+  theme_graph()
+
+# visualize the closeness centrality of the weighted New York street graph
+newyork_street_graph %>%
+  ggraph(layout = 'kk') +
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = closeness_weighted, colour = closeness_weighted)) +
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Closeness centrality of weighted New York street graph') +
+  theme_graph()
+
+
+# visualize the betweenness centrality of the weighted New York street graph
+newyork_street_graph %>%
+  ggraph(layout = 'kk') +
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = betweenness_weighted, colour = betweenness_weighted)) +
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Betweenness centrality of weighted New York street graph') +
+  theme_graph()
+
+
+
+# visualize the degree centrality of the unweighted New York street graph
+newyork_street_graph %>%
+  ggraph(layout = 'kk') +
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = degree_unweighted, colour = degree_unweighted)) +
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Degree centrality of unweighted New York street graph') +
+  theme_graph()
+
+# visualize the closeness centrality of the unweighted New York street graph
+newyork_street_graph %>%
+  ggraph(layout = 'kk') +
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = closeness_unweighted, colour = closeness_unweighted)) +
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Closeness centrality of unweighted New York street graph') +
+  theme_graph()
+
+
+# visualize the betweenness centrality of the unweighted New York street graph
+newyork_street_graph %>%
+  ggraph(layout = 'kk') +
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = betweenness_unweighted, colour = betweenness_unweighted)) +
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Betweenness centrality of unweighted New York street graph') +
+  theme_graph()
+
+```
+
+Calculate the centrality of the Zurich dual graph
+```{r centrality_dual_graph_zurich, echo = TRUE, warning= FALSE, message = FALSE}
+# calculate the degree centrality of the Zurich dual graph
+zurich_dual_graph <- zurich_dual_graph %>%
+  mutate(degree = centrality_degree()) %>%   # calculate the degree centrality
+  mutate(closeness = centrality_closeness()) %>%   # calculate the closeness centrality
+  mutate(betweenness = centrality_betweenness())   # calculate the betweenness centrality
+
+# visualize the degree centrality of the Zurich dual graph
+zurich_dual_graph %>% 
+  ggraph(layout = 'kk') + 
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = degree, colour = degree)) + 
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Degree centrality of Zurich dual graph') +
+  theme_graph()
+
+# visualize the degree centrality of the Zurich dual graph
+zurich_dual_graph %>% 
+  ggraph(layout = 'kk') + 
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = closeness, colour = closeness)) + 
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Closeness centrality of Zurich dual graph') +
+  theme_graph()
+
+# visualize the degree centrality of the Zurich dual graph
+zurich_dual_graph %>% 
+  ggraph(layout = 'kk') + 
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = betweenness, colour = betweenness)) + 
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Betweenness centrality of Zurich dual graph') +
+  theme_graph()
+```
+
+Calculate the centrality of the New York dual graph
+```{r centrality_dual_graph_newyork, echo = TRUE, warning= FALSE, message = FALSE}
+# calculate the degree centrality of the New York dual graph
+newyork_dual_graph <- newyork_dual_graph %>%
+  mutate(degree = centrality_degree()) %>%   # calculate the degree centrality
+  mutate(closeness = centrality_closeness()) %>%   # calculate the closeness centrality
+  mutate(betweenness = centrality_betweenness())   # calculate the betweenness centrality
+
+# visualize the degree centrality of the New York dual graph
+newyork_dual_graph %>% 
+  ggraph(layout = 'kk') + 
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = degree, colour = degree)) + 
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Degree centrality of New York dual graph') +
+  theme_graph()
+
+# visualize the degree centrality of the New York dual graph
+newyork_dual_graph %>% 
+  ggraph(layout = 'kk') + 
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = closeness, colour = closeness)) + 
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Closeness centrality of New York dual graph') +
+  theme_graph()
+
+# visualize the degree centrality of the New York dual graph
+newyork_dual_graph %>% 
+  ggraph(layout = 'kk') + 
+  geom_edge_link(colour = "grey") +
+  geom_node_point(aes(size = betweenness, colour = betweenness)) + 
+  scale_color_continuous(guide = 'legend', type = "viridis") +
+  ggtitle('Betweenness centrality of New York dual graph') +
+  theme_graph()
+
+```
+
+## 2.3. Visual and numerical analytics
+Analyze the weighted Zurich street graph
+```{r analytics_street_graph_zurich_weighted, echo = TRUE, warning= FALSE, message = FALSE}
+# get ggraph of Zurich street graph
+zurich_street_graph_g <- ggraph(zurich_street_graph, layout = "kk")[["data"]]
+print("summary of degree centrality of Zurich street graph")
+summary(zurich_street_graph_g$degree_weighted)
+print("summary of closeness centrality of Zurich street graph")
+summary(zurich_street_graph_g$closeness_weighted)
+print("summary of betweenness centrality of Zurich street graph")
+summary(zurich_street_graph_g$betweenness_weighted)
+
+
+# plot the frequency distribution of degree centrality
+ggplot(zurich_street_graph_g) +
+  geom_histogram(aes(degree_weighted)) + 
+  ggtitle("Frequency distributoin of degree centrality of Zurich street graph")
+
+# check whether degree centrality is normally distributed
+# plot Q-Q plot
+qqnorm(zurich_street_graph_g$degree_weighted)
+qqline(zurich_street_graph_g$degree_weighted)
+
+# perform shapiro-wilk test
+shapiro.test(zurich_street_graph_g$degree_weighted)  # the p-value is less than 0.05, so the closeness centrality is not normally distributed
+
+
+# plot the frequency distribution of closeness centrality
+ggplot(zurich_street_graph_g) +
+  geom_histogram(aes(closeness_weighted)) + 
+  ggtitle("Frequency distributoin of closeness centrality of Zurich street graph")
+
+# check whether closeness centrality is normally distributed
+# plot Q-Q plot
+qqnorm(zurich_street_graph_g$closeness_weighted)
+qqline(zurich_street_graph_g$closeness_weighted)
+
+# perform shapiro-wilk test
+shapiro.test(zurich_street_graph_g$closeness_weighted)  # the p-value is less than 0.05, so the closeness centrality is not normally distributed
+
+
+# plot the frequency distribution of betweenness centrality
+ggplot(zurich_street_graph_g) +
+  geom_histogram(aes(betweenness_weighted)) + 
+  scale_x_continuous() +
+  ggtitle("Frequency distributoin of betweenness centrality of Zurich street graph")
+
+# check whether betweenness centrality is normally distributed
+# plot Q-Q plot
+qqnorm(zurich_street_graph_g$betweenness_weighted)
+qqline(zurich_street_graph_g$betweenness_weighted)
+
+# perform shapiro-wilk test
+shapiro.test(zurich_street_graph_g$betweenness_weighted)  # the p-value is less than 0.05, so the closeness centrality is not normally distributed
+
+
+# plot centralities in edges
+# merge centralities with from nodes
+zurich_node_from <- merge(x=zurich_street, y=zurich_street_graph_g, by.x="from_", by.y="name")
+zurich_node_from <- zurich_node_from[, c("from_", "to", "degree_weighted", "closeness_weighted", "betweenness_weighted", "geometry")]
+
+# merge centralities with from and to nodes
+zurich_eg_centrality <- merge(x=zurich_node_from, y=zurich_street_graph_g, by.x="to", by.y="name")
+
+# calculate the mean in edges
+zurich_eg_centrality <- zurich_eg_centrality %>%
+  mutate(degree_weighted = (degree_weighted.x+degree_weighted.y)/2,
+         closeness_weighted = (closeness_weighted.x+closeness_weighted.y)/2,
+         betweenness_weighted = (betweenness_weighted.x+betweenness_weighted.y)/2)
+zurich_eg_centrality <- zurich_eg_centrality[, c("from_", "to", "degree_weighted", "closeness_weighted", "betweenness_weighted", "geometry")]
+
+# # plot closeness centrality in edges
+# ggplot(data = zurich_eg_centrality) +
+#   geom_sf(aes(color = closeness)) +
+#   scale_color_viridis(option = "plasma") +
+#   theme_void() +
+#   ggtitle("Closeness centrality of Zurich street graph in edges")
+# 
+# # plot betweenness centrality in edges
+# ggplot(data = zurich_eg_centrality) +
+#   geom_sf(aes(color = betweenness)) +
+#   scale_color_viridis(option = "plasma") +
+#   theme_void() +
+#   ggtitle("Betweenness centrality of Zurich street graph in edges")
+
+tmap_mode("view")
+
+# plot degree centrality in edges
+tm_shape(zurich_eg_centrality) + tm_lines("degree_weighted", palette = "-RdBu") + tm_basemap("CartoDB.DarkMatter")
+
+# plot closeness centrality in edges
+tm_shape(zurich_eg_centrality) + tm_lines("closeness_weighted", palette = "-RdBu") + tm_basemap("CartoDB.DarkMatter")
+
+# plot betweenness centrality in edges
+tm_shape(zurich_eg_centrality) + tm_lines("betweenness_weighted", palette = "-RdBu") + tm_basemap("CartoDB.DarkMatter")
+
+```
+
+Analyze the unweighted Zurich street graph
+```{r analytics_street_graph_zurich_unweighted, echo = TRUE, warning= FALSE, message = FALSE}
+# get ggraph of Zurich street graph
+zurich_street_graph_g <- ggraph(zurich_street_graph, layout = "kk")[["data"]]
+print("summary of degree centrality of Zurich street graph")
+summary(zurich_street_graph_g$degree_unweighted)
+print("summary of closeness centrality of Zurich street graph")
+summary(zurich_street_graph_g$closeness_unweighted)
+print("summary of betweenness centrality of Zurich street graph")
+summary(zurich_street_graph_g$betweenness_unweighted)
+
+
+
+# plot the frequency distribution of degree centrality
+ggplot(zurich_street_graph_g) +
+  geom_histogram(aes(degree_unweighted)) + 
+  ggtitle("Frequency distributoin of degree centrality of Zurich street graph")
+
+# check whether degree centrality is normally distributed
+# plot Q-Q plot
+qqnorm(zurich_street_graph_g$degree_unweighted)
+qqline(zurich_street_graph_g$degree_unweighted)
+
+# perform shapiro-wilk test
+shapiro.test(zurich_street_graph_g$degree_unweighted)  # the p-value is less than 0.05, so the closeness centrality is not normally distributed
+
+
+# plot the frequency distribution of closeness centrality
+ggplot(zurich_street_graph_g) +
+  geom_histogram(aes(closeness_unweighted)) + 
+  ggtitle("Frequency distributoin of closeness centrality of Zurich street graph")
+
+# check whether closeness centrality is normally distributed
+# plot Q-Q plot
+qqnorm(zurich_street_graph_g$closeness_unweighted)
+qqline(zurich_street_graph_g$closeness_unweighted)
+
+# perform shapiro-wilk test
+shapiro.test(zurich_street_graph_g$closeness_unweighted)  # the p-value is less than 0.05, so the closeness centrality is not normally distributed
+
+
+# plot the frequency distribution of betweenness centrality
+ggplot(zurich_street_graph_g) +
+  geom_histogram(aes(betweenness_unweighted)) + 
+  scale_x_continuous() +
+  ggtitle("Frequency distributoin of betweenness centrality of Zurich street graph")
+
+# check whether betweenness centrality is normally distributed
+# plot Q-Q plot
+qqnorm(zurich_street_graph_g$betweenness_unweighted)
+qqline(zurich_street_graph_g$betweenness_unweighted)
+
+# perform shapiro-wilk test
+shapiro.test(zurich_street_graph_g$betweenness_unweighted)  # the p-value is less than 0.05, so the closeness centrality is not normally distributed
+
+
+# plot centralities in edges
+# merge centralities with from nodes
+zurich_node_from <- merge(x=zurich_street, y=zurich_street_graph_g, by.x="from_", by.y="name")
+zurich_node_from <- zurich_node_from[, c("from_", "to", "degree_unweighted", "closeness_unweighted", "betweenness_unweighted", "geometry")]
+
+# merge centralities with from and to nodes
+zurich_eg_centrality <- merge(x=zurich_node_from, y=zurich_street_graph_g, by.x="to", by.y="name")
+
+# calculate the mean in edges
+zurich_eg_centrality <- zurich_eg_centrality %>%
+  mutate(degree_unweighted = (degree_unweighted.x+degree_unweighted.y)/2,
+         closeness_unweighted = (closeness_unweighted.x+closeness_unweighted.y)/2,
+         betweenness_unweighted = (betweenness_unweighted.x+betweenness_unweighted.y)/2)
+zurich_eg_centrality <- zurich_eg_centrality[, c("from_", "to", "degree_unweighted", "closeness_unweighted", "betweenness_unweighted", "geometry")]
+
+# # plot closeness centrality in edges
+# ggplot(data = zurich_eg_centrality) +
+#   geom_sf(aes(color = closeness)) +
+#   scale_color_viridis(option = "plasma") +
+#   theme_void() +
+#   ggtitle("Closeness centrality of Zurich street graph in edges")
+# 
+# # plot betweenness centrality in edges
+# ggplot(data = zurich_eg_centrality) +
+#   geom_sf(aes(color = betweenness)) +
+#   scale_color_viridis(option = "plasma") +
+#   theme_void() +
+#   ggtitle("Betweenness centrality of Zurich street graph in edges")
+
+tmap_mode("view")
+
+# plot degree centrality in edges
+tm_shape(zurich_eg_centrality) + tm_lines("degree_unweighted", palette = "-RdBu") + tm_basemap("CartoDB.DarkMatter")
+
+# plot closeness centrality in edges
+tm_shape(zurich_eg_centrality) + tm_lines("closeness_unweighted", palette = "-RdBu") + tm_basemap("CartoDB.DarkMatter")
+
+# plot betweenness centrality in edges
+tm_shape(zurich_eg_centrality) + tm_lines("betweenness_unweighted", palette = "-RdBu") + tm_basemap("CartoDB.DarkMatter")
+
+```
+
+
+Analyze the weighted New York street graph
+```{r analytics_street_graph_newyork_weighted, echo = TRUE, warning= FALSE, message = FALSE}
+# get ggraph of New York street graph
+newyork_street_graph_g <- ggraph(newyork_street_graph, layout = "kk")[["data"]]
+print("summary of degree centrality of New York street graph")
+summary(newyork_street_graph_g$degree_weighted)
+print("summary of closeness centrality of New York street graph")
+summary(newyork_street_graph_g$closeness_weighted)
+print("summary of betweenness centrality of New York street graph")
+summary(newyork_street_graph_g$betweenness_weighted)
+
+
+# plot the frequency distribution of degree centrality
+ggplot(newyork_street_graph_g) +
+  geom_histogram(aes(degree_weighted)) + 
+  ggtitle("Frequency distributoin of degree centrality of New York street graph")
+
+# check whether degree centrality is normally distributed
+# plot Q-Q plot
+qqnorm(newyork_street_graph_g$degree_weighted)
+qqline(newyork_street_graph_g$degree_weighted)
+
+# perform shapiro-wilk test
+shapiro.test(newyork_street_graph_g$degree_weighted)  # the p-value is less than 0.05, so the closeness centrality is not normally distributed
+
+
+# plot the frequency distribution of closeness centrality
+ggplot(newyork_street_graph_g) +
+  geom_histogram(aes(closeness_weighted)) + 
+  ggtitle("Frequency distributoin of closeness centrality of New York street graph")
+
+# check whether closeness centrality is normally distributed
+# plot Q-Q plot
+qqnorm(newyork_street_graph_g$closeness_weighted)
+qqline(newyork_street_graph_g$closeness_weighted)
+
+# perform shapiro-wilk test
+shapiro.test(newyork_street_graph_g$closeness_weighted)  # the p-value is less than 0.05, so the closeness centrality is not normally distributed
+
+
+# plot the frequency distribution of betweenness centrality
+ggplot(newyork_street_graph_g) +
+  geom_histogram(aes(betweenness_weighted)) + 
+  scale_x_continuous() +
+  ggtitle("Frequency distributoin of betweenness centrality of New York street graph")
+
+# check whether betweenness centrality is normally distributed
+# plot Q-Q plot
+qqnorm(newyork_street_graph_g$betweenness_weighted)
+qqline(newyork_street_graph_g$betweenness_weighted)
+
+# perform shapiro-wilk test
+shapiro.test(newyork_street_graph_g$betweenness_weighted)  # the p-value is less than 0.05, so the closeness centrality is not normally distributed
+
+
+# plot centralities in edges
+# merge centralities with from nodes
+newyork_node_from <- merge(x=newyork_street, y=newyork_street_graph_g, by.x="from_", by.y="name")
+newyork_node_from <- newyork_node_from[, c("from_", "to", "degree_weighted", "closeness_weighted", "betweenness_weighted", "geometry")]
+
+# merge centralities with from and to nodes
+newyork_eg_centrality <- merge(x=newyork_node_from, y=newyork_street_graph_g, by.x="to", by.y="name")
+
+# calculate the mean in edges
+newyork_eg_centrality <- newyork_eg_centrality %>%
+  mutate(degree_weighted = (degree_weighted.x+degree_weighted.y)/2,
+         closeness_weighted = (closeness_weighted.x+closeness_weighted.y)/2,
+         betweenness_weighted = (betweenness_weighted.x+betweenness_weighted.y)/2)
+newyork_eg_centrality <- newyork_eg_centrality[, c("from_", "to", "degree_weighted", "closeness_weighted", "betweenness_weighted", "geometry")]
+
+# # plot closeness centrality in edges
+# ggplot(data = newyork_eg_centrality) +
+#   geom_sf(aes(color = closeness)) +
+#   scale_color_viridis(option = "plasma") +
+#   theme_void() +
+#   ggtitle("Closeness centrality of newyork street graph in edges")
+# 
+# # plot betweenness centrality in edges
+# ggplot(data = newyork_eg_centrality) +
+#   geom_sf(aes(color = betweenness)) +
+#   scale_color_viridis(option = "plasma") +
+#   theme_void() +
+#   ggtitle("Betweenness centrality of newyork street graph in edges")
+
+tmap_mode("view")
+
+# plot degree centrality in edges
+tm_shape(newyork_eg_centrality) + tm_lines("degree_weighted", palette = "-RdBu") + tm_basemap("CartoDB.DarkMatter")
+
+# plot closeness centrality in edges
+tm_shape(newyork_eg_centrality) + tm_lines("closeness_weighted", palette = "-RdBu") + tm_basemap("CartoDB.DarkMatter")
+
+# plot betweenness centrality in edges
+tm_shape(newyork_eg_centrality) + tm_lines("betweenness_weighted", palette = "-RdBu") + tm_basemap("CartoDB.DarkMatter")
+
+```
+
+Analyze the unweighted New York street graph
+```{r analytics_street_graph_newyork_unweighted, echo = TRUE, warning= FALSE, message = FALSE}
+# get ggraph of New York street graph
+newyork_street_graph_g <- ggraph(newyork_street_graph, layout = "kk")[["data"]]
+print("summary of degree centrality of New York street graph")
+summary(newyork_street_graph_g$degree_unweighted)
+print("summary of closeness centrality of New York street graph")
+summary(newyork_street_graph_g$closeness_unweighted)
+print("summary of betweenness centrality of New York street graph")
+summary(newyork_street_graph_g$betweenness_unweighted)
+
+
+# plot the frequency distribution of degree centrality
+ggplot(newyork_street_graph_g) +
+  geom_histogram(aes(degree_unweighted)) + 
+  ggtitle("Frequency distributoin of degree centrality of New York street graph")
+
+# check whether degree centrality is normally distributed
+# plot Q-Q plot
+qqnorm(newyork_street_graph_g$degree_unweighted)
+qqline(newyork_street_graph_g$degree_unweighted)
+
+# perform shapiro-wilk test
+shapiro.test(newyork_street_graph_g$degree_unweighted)  # the p-value is less than 0.05, so the closeness centrality is not normally distributed
+
+
+# plot the frequency distribution of closeness centrality
+ggplot(newyork_street_graph_g) +
+  geom_histogram(aes(closeness_unweighted)) + 
+  ggtitle("Frequency distributoin of closeness centrality of New York street graph")
+
+# check whether closeness centrality is normally distributed
+# plot Q-Q plot
+qqnorm(newyork_street_graph_g$closeness_unweighted)
+qqline(newyork_street_graph_g$closeness_unweighted)
+
+# perform shapiro-wilk test
+shapiro.test(newyork_street_graph_g$closeness_unweighted)  # the p-value is less than 0.05, so the closeness centrality is not normally distributed
+
+
+# plot the frequency distribution of betweenness centrality
+ggplot(newyork_street_graph_g) +
+  geom_histogram(aes(betweenness_unweighted)) + 
+  scale_x_continuous() +
+  ggtitle("Frequency distributoin of betweenness centrality of New York street graph")
+
+# check whether betweenness centrality is normally distributed
+# plot Q-Q plot
+qqnorm(newyork_street_graph_g$betweenness_unweighted)
+qqline(newyork_street_graph_g$betweenness_unweighted)
+
+# perform shapiro-wilk test
+shapiro.test(newyork_street_graph_g$betweenness_unweighted)  # the p-value is less than 0.05, so the closeness centrality is not normally distributed
+
+
+# plot centralities in edges
+# merge centralities with from nodes
+newyork_node_from <- merge(x=newyork_street, y=newyork_street_graph_g, by.x="from_", by.y="name")
+newyork_node_from <- newyork_node_from[, c("from_", "to", "degree_unweighted", "closeness_unweighted", "betweenness_unweighted", "geometry")]
+
+# merge centralities with from and to nodes
+newyork_eg_centrality <- merge(x=newyork_node_from, y=newyork_street_graph_g, by.x="to", by.y="name")
+
+# calculate the mean in edges
+newyork_eg_centrality <- newyork_eg_centrality %>%
+  mutate(degree_unweighted = (degree_unweighted.x+degree_unweighted.y)/2,
+         closeness_unweighted = (closeness_unweighted.x+closeness_unweighted.y)/2,
+         betweenness_unweighted = (betweenness_unweighted.x+betweenness_unweighted.y)/2)
+newyork_eg_centrality <- newyork_eg_centrality[, c("from_", "to", "degree_unweighted", "closeness_unweighted", "betweenness_unweighted", "geometry")]
+
+# # plot closeness centrality in edges
+# ggplot(data = newyork_eg_centrality) +
+#   geom_sf(aes(color = closeness)) +
+#   scale_color_viridis(option = "plasma") +
+#   theme_void() +
+#   ggtitle("Closeness centrality of newyork street graph in edges")
+# 
+# # plot betweenness centrality in edges
+# ggplot(data = newyork_eg_centrality) +
+#   geom_sf(aes(color = betweenness)) +
+#   scale_color_viridis(option = "plasma") +
+#   theme_void() +
+#   ggtitle("Betweenness centrality of newyork street graph in edges")
+
+tmap_mode("view")
+
+# plot degree centrality in edges
+tm_shape(newyork_eg_centrality) + tm_lines("degree_unweighted", palette = "-RdBu") + tm_basemap("CartoDB.DarkMatter")
+
+# plot closeness centrality in edges
+tm_shape(newyork_eg_centrality) + tm_lines("closeness_unweighted", palette = "-RdBu") + tm_basemap("CartoDB.DarkMatter")
+
+# plot betweenness centrality in edges
+tm_shape(newyork_eg_centrality) + tm_lines("betweenness_unweighted", palette = "-RdBu") + tm_basemap("CartoDB.DarkMatter")
+
+```
+
+Analyze the Zurich dual graph
+```{r analytics_dual_graph_zurich, echo = TRUE, warning= FALSE, message = FALSE}
+# get ggraph of Zurich dual graph
+zurich_dual_graph_g <- ggraph(zurich_dual_graph, layout = "kk")[["data"]]
+print("summary of degree centrality of Zurich dual graph")
+summary(zurich_dual_graph_g$degree)
+print("summary of closeness centrality of Zurich dual graph")
+summary(zurich_dual_graph_g$closeness)
+print("summary of betweenness centrality of Zurich dual graph")
+summary(zurich_dual_graph_g$betweenness)
+
+# plot the frequency distribution of degree centrality
+ggplot(zurich_dual_graph_g) +
+  geom_histogram(aes(degree)) + 
+  scale_x_continuous(breaks=seq(1, 9, 1)) +
+  ggtitle("Frequency distributoin of degree centrality of Zurich dual graph")
+
+# check whether degree centrality is normally distributed
+# plot Q-Q plot
+qqnorm(zurich_dual_graph_g$degree)
+qqline(zurich_dual_graph_g$degree)
+
+# perform shapiro-wilk test
+shapiro.test(zurich_dual_graph_g$degree)  # the p-value is less than 0.05, so the closeness centrality is not normally distributed
+
+# plot the frequency distribution of closeness centrality
+ggplot(zurich_dual_graph_g) +
+  geom_histogram(aes(closeness)) + 
+  scale_x_continuous() +
+  ggtitle("Frequency distributoin of closeness centrality of Zurich dual graph")
+
+# check whether closeness centrality is normally distributed
+# plot Q-Q plot
+qqnorm(zurich_dual_graph_g$closeness)
+qqline(zurich_dual_graph_g$closeness)
+
+# perform shapiro-wilk test
+shapiro.test(zurich_dual_graph_g$closeness)  # the p-value is less than 0.05, so the closeness centrality is not normally distributed
+
+# plot the frequency distribution of betweenness centrality
+ggplot(zurich_dual_graph_g) +
+  geom_histogram(aes(betweenness)) + 
+  scale_x_continuous() +
+  ggtitle("Frequency distributoin of betweenness centrality of Zurich dual graph")
+
+# check whether betweenness centrality is normally distributed
+# plot Q-Q plot
+qqnorm(zurich_dual_graph_g$betweenness)
+qqline(zurich_dual_graph_g$betweenness)
+
+# perform shapiro-wilk test
+shapiro.test(zurich_dual_graph_g$betweenness)  # the p-value is less than 0.05, so the closeness centrality is not normally distributed
+
+```
+
+Analyze the New York dual graph
+```{r analytics_dual_graph_newyork, echo = TRUE, warning= FALSE, message = FALSE}
+# get ggraph of newyork dual graph
+newyork_dual_graph_g <- ggraph(newyork_dual_graph, layout = "kk")[["data"]]
+print("summary of degree centrality of New York dual graph")
+summary(newyork_dual_graph_g$degree)
+print("summary of closeness centrality of New York dual graph")
+summary(newyork_dual_graph_g$closeness)
+print("summary of betweenness centrality of New York dual graph")
+summary(newyork_dual_graph_g$betweenness)
+
+# plot the frequency distribution of degree centrality
+ggplot(newyork_dual_graph_g) +
+  geom_histogram(aes(degree)) + 
+  scale_x_continuous(breaks=seq(1, 9, 1)) +
+  ggtitle("Frequency distributoin of degree centrality of New York dual graph")
+
+# check whether degree centrality is normally distributed
+# plot Q-Q plot
+qqnorm(newyork_dual_graph_g$degree)
+qqline(newyork_dual_graph_g$degree)
+
+
+# plot the frequency distribution of closeness centrality
+ggplot(newyork_dual_graph_g) +
+  geom_histogram(aes(closeness)) + 
+  scale_x_continuous() +
+  ggtitle("Frequency distributoin of closeness centrality of New York dual graph")
+
+# check whether closeness centrality is normally distributed
+# plot Q-Q plot
+qqnorm(newyork_dual_graph_g$closeness)
+qqline(newyork_dual_graph_g$closeness)
+
+
+# plot the frequency distribution of betweenness centrality
+ggplot(newyork_dual_graph_g) +
+  geom_histogram(aes(betweenness)) + 
+  scale_x_continuous() +
+  ggtitle("Frequency distributoin of betweenness centrality of New York dual graph")
+
+# check whether betweenness centrality is normally distributed
+# plot Q-Q plot
+qqnorm(newyork_dual_graph_g$betweenness)
+qqline(newyork_dual_graph_g$betweenness)
+
+
+```
+
+
+
+# 3. Time series analysis
+## 3.1. Analytics of the AirPassengers data
+Get the autocorrelation of the AirPassengers time series data with ACF
+```{r AirPassengers_ACF, echo = TRUE, warning= FALSE, message = FALSE}
+# plot the AirPassengers
+plot(AirPassengers)
+
+# get the ACF
+acf_airpsg <- acf(AirPassengers)
+
+```
+
+Decompose the AirPassengers time series data with STL
+```{r AirPassengers_STL, echo = TRUE, warning= FALSE, message = FALSE}
+# try different window sizes with STL
+swindow <- list("periodic", 3, 5)
+for (i in swindow) {
+  # set up stl function
+  stl_fit <- stl(AirPassengers, s.window = i)
+  print(autoplot(stl_fit, ts.colour = 'blue', main = paste("window size:", i)))
+    
+  # check whether the data is based on an addictive process or a multiplicative process
+  plot(stl_fit$time.series[,1]+stl_fit$time.series[,2]+stl_fit$time.series[,3], main = "Additive model")
+  plot(stl_fit$time.series[,1]*stl_fit$time.series[,2]*stl_fit$time.series[,3], main = "Multiplicative model")
+}
+
+```
+
+Qualify the results of STL models
+```{r AirPassengers_STL_qualify_results, echo = TRUE, warning= FALSE, message = FALSE}
+# qualify the result of STL models by checking the remainders
+for (i in swindow) {
+  # set up stl function
+  stl_fit <- stl(AirPassengers, s.window = i)
+  # print(autoplot(stl_fit, ts.colour = 'blue'))
+  
+  # check the remainder with ACF
+  print(acf(stl_fit$time.series[,3]))
+  
+  # check whether the remainder is a Gussian noise with Q-Q plot
+  par(mfrow = c(1,2))
+  plot(stl_fit$time.series[,3], 
+       col = "blue", main = 'Remainder', ylab = "")
+  qqnorm(stl_fit$time.series[,3])
+  qqline(stl_fit$time.series[,3])
+  mtext(paste("window size:", i), side = 3, line = -1, outer = TRUE)
+  par(mfrow = c(1,1))
+  
+  # perform shapiro-wilk test
+  print(shapiro.test(stl_fit$time.series[,3]))
+}
+
+```
+
+Prepare training and testing datasets for the prediction of AirPassengers time series data
+```{r AirPassengers_prepare_data, echo = TRUE, warning= FALSE, message = FALSE}
+# get subset of AirPassengers data from 1949 to 1959 as the training dataset
+train <- window(AirPassengers, end = c(1959,12))
+# get subset of AirPassengers data in 1960 as the testing dataset
+test <- window(AirPassengers, start = 1960)
+
+# this function plots a forcast evaluation
+forecast_eval = function(forecast, model_name = "", eval_set = test){
+  model_name = model_name
+  forecast %>% 
+    autoplot() + 
+    ylab("Value") +
+    autolayer(test, series = "Test set") +
+    labs(title = paste(model_name, "across test set"))
+}
+```
+
+Apply the exponential smoothing model to the AirPassengers time series data
+```{r AirPassengers_ETS, echo = TRUE, warning= FALSE, message = FALSE}
+# apply exponential smoothing model
+aitpsg_ets <- train %>%
+  ets()
+aitpsg_ets
+checkresiduals(aitpsg_ets)
+aitpsg_ets_pred <- aitpsg_ets %>%
+  forecast(h=length(test), level=0.89) 
+# plot the prediction results
+aitpsg_ets_pred %>%
+  forecast_eval(model_name="Exponential smoothing model")
+# get the accuracy of the prediction results
+aitpsg_ets_pred %>% accuracy()
+
+# apply exponential smoothing model from STL decomposition
+aitpsg_ets_stl <- stlm(train, s.window = 3, modelfunction=ets)
+aitpsg_ets_stl$model
+checkresiduals(aitpsg_ets_stl$model)
+aitpsg_ets_stl_pred <- aitpsg_ets_stl %>%
+  forecast(h=12)
+# plot the prediction results
+aitpsg_ets_stl_pred %>%
+  forecast_eval(model_name="STL + Exponential smoothing model")
+# get the accuracy of the prediction results
+aitpsg_ets_stl_pred %>% accuracy()
+```
+
+Apply the ARIMA model to the AirPassengers time series data
+```{r AirPassengers_ARIMA, echo = TRUE, warning= FALSE, message = FALSE}
+# apply ARIMA model
+airpsg_arima <- train %>%
+  auto.arima()
+airpsg_arima
+checkresiduals(airpsg_arima)
+airpsg_arima_pred <- airpsg_arima %>%
+  forecast(h=length(test), level=0.89)
+# plot the prediction results
+airpsg_arima_pred %>%
+  forecast_eval(model_name="ARIMA model")
+# get the accuracy of the prediction results
+airpsg_arima_pred %>% accuracy()
+
+# apply exponential smoothing model from STL decomposition
+aitpsg_arima_stl <- stlm(train, s.window = 3, modelfunction=Arima, order=c(1,1,0), seasonal=c(0,1,0))
+aitpsg_arima_stl$model
+checkresiduals(aitpsg_arima_stl$model)
+aitpsg_arima_stl_pred <- aitpsg_arima_stl %>%
+  forecast(h=12)
+# plot the prediction results
+aitpsg_arima_stl_pred %>%
+  forecast_eval(model_name="STL + ARIMA model")
+# get the accuracy of the prediction results
+aitpsg_arima_stl_pred %>% accuracy()
+```
+
+## 3.2. Analytics of the 2020 data
+Create the ts object of Zurich pedestrian 2020 data
+```{r zurich_create_ts_obj, echo = TRUE, warning= FALSE, message = FALSE}
+library(lubridate)
+# create an xts object of zurich_ped_2020
+zurich_xts_2020 <- xts(zurich_ped_2020$PED_TOTAL, zurich_ped_2020$DATE)
+
+# get the date of the first day of zurich_ped_2020
+start <- c(date(xts::first(zurich_xts_2020)))
+start
+
+# get the date of the last day of zurich_ped_2020
+end <- c(date(xts::last(zurich_xts_2020)))
+end
+
+# create an ts object of zurich_ped_2020
+zurich_ts_2020 <- ts(data = as.vector(coredata(zurich_xts_2020)),
+                         start = start,
+                         end = end, frequency = 1)
+zurich_ts_2020
+```
+
+Apply the changepoint package to find the change points of Zurich pedestrian 2020 data
+```{r zurich_changepoint, echo = TRUE, warning= FALSE, message = FALSE}
+# find the change points with the BinSeg method
+zurich_changepoint_fit = cpt.mean(zurich_ts_2020, penalty = "BIC", method = "BinSeg")
+
+# get the date of change points and the mean value in each period
+ints <- param.est(zurich_changepoint_fit)$mean
+cp <- cpts(zurich_changepoint_fit)
+
+# plot the change points
+plot(zurich_changepoint_fit, xaxt="n", main = "Method: BinSeg")
+axis(1, as.Date(18262+cp), format(as.Date(18262+cp), "%b %d"), cex.axis = .7)
+abline(v=as.Date(18262+cp), lty=2)
+
+# create a data frame to store the results
+zurich_changepoint_df <- data.frame(matrix(ncol = 2, nrow = 6))
+colnames(zurich_changepoint_df) <- c("date_start", "ped_mean")
+zurich_changepoint_df$date_start <- c(as.Date(18262), as.Date(18262+cp))
+zurich_changepoint_df$ped_mean <- ints
+zurich_changepoint_df
+
+
+# find the change points with the SegNeigh method
+zurich_changepoint_fit = cpt.mean(zurich_ts_2020, penalty = "BIC", method = "SegNeigh")
+
+# get the date of change points and the mean value in each period
+ints <- param.est(zurich_changepoint_fit)$mean
+cp <- cpts(zurich_changepoint_fit)
+
+# plot the change points
+plot(zurich_changepoint_fit, xaxt="n", main = "Method: SegNeigh")
+axis(1, as.Date(18262+cp), format(as.Date(18262+cp), "%b %d"), cex.axis = .7)
+abline(v=as.Date(18262+cp), lty=2)
+
+# create a data frame to store the results
+zurich_changepoint_df <- data.frame(matrix(ncol = 2, nrow = 5))
+colnames(zurich_changepoint_df) <- c("date_start", "ped_mean")
+zurich_changepoint_df$date_start <- c(as.Date(18262), as.Date(18262+cp))
+zurich_changepoint_df$ped_mean <- ints
+zurich_changepoint_df
+```
+
+Apply the strucchange package to find the change points of Zurich pedestrian 2020 data
+```{r zurich_strucchange_test, echo = TRUE, warning= FALSE, message = FALSE}
+# apply CUSUM test
+zurich_ocus <- efp(zurich_ts_2020 ~ 1, type = "OLS-CUSUM")
+
+# compute the empirical fluctuation process of OLS residuals
+op <- par(mfrow = c(1,2))
+plot(zurich_ocus, xaxt="n")
+axis(1, as.Date(c(18262, 18353, 18444, 18536, 18627)), format(as.Date(c(18262, 18353, 18444, 18536, 18627)), "%b %d"), cex.axis = .7)
+plot(zurich_ocus, alpha = 0.01, alt.boundary = TRUE, xaxt="n")
+axis(1, as.Date(c(18262, 18353, 18444, 18536, 18627)), format(as.Date(c(18262, 18353, 18444, 18536, 18627)), "%b %d"), cex.axis = .7)
+op <- par(mfrow = c(1,1))
+
+# calculate the corresponding CUSUM
+sctest(zurich_ocus)
+
+# apply F test
+zurich_fs <- Fstats(zurich_ts_2020 ~ 1)
+plot(zurich_fs, xaxt="n")
+axis(1, as.Date(c(18262, 18353, 18444, 18536, 18627)), format(as.Date(c(18262, 18353, 18444, 18536, 18627)), "%b %d"), cex.axis = .7)
+
+```
+
+```{r zurich_strucchange, echo = TRUE, warning= FALSE, message = FALSE}
+# test for 1 break point
+zurich_strucchange_bp <- breakpoints(zurich_ts_2020 ~ 1)
+zurich_strucchange_bp
+plot(zurich_strucchange_bp)
+
+# find the optimal number of breakpoints based on BIC
+opt_bpts <- function(x) {
+  #x = bpts_sum$RSS["BIC",]
+  n <- length(x)
+  lowest <- vector("logical", length = n-1)
+  lowest[1] <- FALSE
+  for (i in 2:n) {
+    lowest[i] <- x[i] < x[i-1] & x[i] < x[i+1]
+  }
+  out <- as.integer(names(x)[lowest])
+  return(out)
+}
+bpts_sum <- summary(zurich_strucchange_bp)
+opt_brks <- opt_bpts(bpts_sum$RSS["BIC",])
+# get the location of breakpoints
+opt_brks
+
+# breakpoints model
+zurich_fac <- breakfactor(zurich_strucchange_bp, breaks = opt_brks)
+fm <- lm(zurich_ts_2020 ~ zurich_fac - 1)
+# plot the breakpoints with confidence intervals
+zurich_ci <- confint(zurich_strucchange_bp, breaks = opt_brks)
+plot(zurich_ts_2020, xaxt="n")
+axis(1, c(as.Date(18262), as.Date(18262+zurich_strucchange_bp$breakpoints)), format(c(as.Date(18262), as.Date(18262+zurich_strucchange_bp$breakpoints)), "%b %d"), cex.axis = .7)
+lines(ts(fitted(fm), start = start), col = "red")
+lines(zurich_strucchange_bp)
+
+# create a data frame to store the results
+zurich_strucchange_df <- data.frame(matrix(ncol = 2, nrow = 4))
+colnames(zurich_strucchange_df) <- c("date_start", "ped_mean")
+zurich_strucchange_df$date_start <- c(as.Date(18262), as.Date(18262+zurich_strucchange_bp$breakpoints))
+zurich_strucchange_df$ped_mean <- as.numeric(fitted(fm)[c(zurich_strucchange_bp$breakpoints, 366)])
+zurich_strucchange_df
+
+```
+
+Compare different segments with ACF
+```{r zurich_compare, echo = TRUE, warning= FALSE, message = FALSE}
+# get Zurich pedestrian data from break point 1 to break point 2
+seg_mar_may <- zurich_ts_2020[zurich_strucchange_bp$breakpoints[1]:zurich_strucchange_bp$breakpoints[2]]
+# get the ACF
+acf(seg_mar_may)
+# get the ACF feature
+feat_acf(seg_mar_may)
+
+# get Zurich pedestrian data from break point 2 to break point 3
+seg_may_oct <- zurich_ts_2020[(zurich_strucchange_bp$breakpoints[2]+1):zurich_strucchange_bp$breakpoints[3]]
+# get the ACF
+acf(seg_may_oct)
+# get the ACF feature
+feat_acf(seg_may_oct)
+```
